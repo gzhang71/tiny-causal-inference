@@ -16,11 +16,14 @@ References:
       causal effects" (DR-learner)
     - Chernozhukov et al. (2018), "Double/debiased machine learning for
       treatment and structural parameters" (Double ML)
+    - Rosenbaum & Rubin (1983), "The central role of the propensity score in
+      observational studies for causal effects" (propensity score matching)
 """
 
 import numpy as np
 from sklearn.base import clone
 from sklearn.model_selection import KFold
+from sklearn.neighbors import NearestNeighbors
 
 EPS = 0.01  # propensity clipping bound
 
@@ -214,6 +217,54 @@ class DoubleML:
         from statistics import NormalDist
         z = NormalDist().inv_cdf(1 - alpha / 2)
         return self.ate_ - z * self.se_, self.ate_ + z * self.se_
+
+    def predict_cate(self, X):
+        return np.full(len(X), self.ate_)
+
+
+class PropensityScoreMatching:
+    """1-nearest-neighbor matching on the propensity score, with replacement.
+
+    Fits e(x) = P(w=1|x), then matches each unit to its nearest neighbor in
+    the opposite arm on the *logit* of the propensity score (matching on the
+    logit is standard practice: it spreads out scores near 0 and 1). Each
+    unit's counterfactual outcome is its match's observed outcome:
+
+        ATT = mean over treated of  y_i - y_matched_control(i)
+        ATC = mean over control of  y_matched_treated(i) - y_i
+        ATE = (n_treated * ATT + n_control * ATC) / n
+
+    The classic, intuitive estimator -- easy to explain and to audit (you can
+    inspect the matched pairs) -- but noisier than model-based estimators
+    because each counterfactual rests on a single neighbor, and it estimates
+    averages only, not tau(x).
+
+    After fit: `att_`, `atc_`, `ate_`. `predict_cate` returns the constant ATE
+    for interface compatibility.
+    """
+
+    def __init__(self, propensity_model):
+        self.propensity_model = propensity_model
+
+    def fit(self, X, w, y):
+        e = _clip_propensity(
+            clone(self.propensity_model).fit(X, w).predict_proba(X)[:, 1])
+        score = np.log(e / (1 - e)).reshape(-1, 1)
+
+        s0, y0 = score[w == 0], y[w == 0]
+        s1, y1 = score[w == 1], y[w == 1]
+
+        # For each treated unit, the nearest control (and vice versa).
+        match_for_treated = NearestNeighbors(n_neighbors=1).fit(s0)
+        match_for_control = NearestNeighbors(n_neighbors=1).fit(s1)
+        idx0 = match_for_treated.kneighbors(s1, return_distance=False)[:, 0]
+        idx1 = match_for_control.kneighbors(s0, return_distance=False)[:, 0]
+
+        self.att_ = np.mean(y1 - y0[idx0])
+        self.atc_ = np.mean(y1[idx1] - y0)
+        n0, n1 = len(y0), len(y1)
+        self.ate_ = (n1 * self.att_ + n0 * self.atc_) / (n0 + n1)
+        return self
 
     def predict_cate(self, X):
         return np.full(len(X), self.ate_)

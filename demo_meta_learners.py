@@ -17,7 +17,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
 
 from meta_learners import (SLearner, TLearner, XLearner, RLearner, DRLearner,
-                           DoubleML)
+                           DoubleML, PropensityScoreMatching)
 
 
 def make_data(n, seed):
@@ -54,6 +54,7 @@ def build_learners(seed):
         "R-learner": RLearner(outcome, effect, propensity, random_state=seed),
         "DR-learner": DRLearner(outcome, effect, propensity, random_state=seed),
         "Double ML": DoubleML(outcome, propensity, random_state=seed),
+        "PS matching": PropensityScoreMatching(propensity),
     }
 
 
@@ -91,9 +92,8 @@ def main():
     lo, hi = dml.confint()
     print()
     print(f"Double ML ATE 95% CI: [{lo:+.3f}, {hi:+.3f}]")
-    print("Note: Double ML assumes a constant effect, so its PEHE reflects the")
-    print("ignored heterogeneity; under heterogeneity its estimand is a")
-    print("variance-weighted average of tau(x), not exactly the ATE.")
+    print("Note: Double ML and PS matching estimate average effects only, so")
+    print("their PEHE reflects the heterogeneity they ignore by design.")
 
 
 if __name__ == "__main__":
