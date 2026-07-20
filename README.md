@@ -1,4 +1,4 @@
-# tiny_causal_inference
+# tiny-causal-inference
 
 Tiny, readable implementations of causal inference methods.
 
