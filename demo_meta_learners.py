@@ -17,7 +17,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
 
 from meta_learners import (SLearner, TLearner, XLearner, RLearner, DRLearner,
-                           DoubleML, PropensityScoreMatching)
+                           DoubleML, IPW, AIPW, PropensityScoreMatching)
 
 
 def make_data(n, seed):
@@ -54,7 +54,9 @@ def build_learners(seed):
         "R-learner": RLearner(outcome, effect, propensity, random_state=seed),
         "DR-learner": DRLearner(outcome, effect, propensity, random_state=seed),
         "Double ML": DoubleML(outcome, propensity, random_state=seed),
-        "PS matching": PropensityScoreMatching(propensity),
+        "IPW": IPW(propensity, random_state=seed),
+        "AIPW": AIPW(outcome, propensity, random_state=seed),
+        "PS matching": PropensityScoreMatching(propensity, caliper=0.2),
     }
 
 
@@ -78,22 +80,29 @@ def main():
     print(f"{'learner':<12} {'PEHE':>8} {'ATE est':>9} {'ATE bias':>9}")
     print("-" * 41)
 
-    dml = None
+    fitted = {}
     for name, learner in build_learners(args.seed).items():
         learner.fit(X, w, y)
+        fitted[name] = learner
         tau_hat = learner.predict_cate(X_test)
         pehe = np.sqrt(np.mean((tau_hat - tau_test) ** 2))
         ate_hat = tau_hat.mean()
         print(f"{name:<12} {pehe:>8.3f} {ate_hat:>+9.3f} "
               f"{ate_hat - true_ate:>+9.3f}")
-        if isinstance(learner, DoubleML):
-            dml = learner
 
-    lo, hi = dml.confint()
     print()
-    print(f"Double ML ATE 95% CI: [{lo:+.3f}, {hi:+.3f}]")
-    print("Note: Double ML and PS matching estimate average effects only, so")
-    print("their PEHE reflects the heterogeneity they ignore by design.")
+    for name in ("Double ML", "IPW", "AIPW"):
+        lo, hi = fitted[name].confint()
+        print(f"{name:<10} ATE 95% CI: [{lo:+.3f}, {hi:+.3f}]")
+
+    psm = fitted["PS matching"]
+    print()
+    print("PS matching balance, max |SMD| over covariates: "
+          f"{np.abs(psm.smd_before_).max():.3f} before -> "
+          f"{np.abs(psm.smd_after_).max():.3f} after matching")
+    print("Note: Double ML, IPW, AIPW, and PS matching estimate average")
+    print("effects only, so their PEHE reflects the heterogeneity they")
+    print("ignore by design.")
 
 
 if __name__ == "__main__":

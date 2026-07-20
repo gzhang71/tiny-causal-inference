@@ -18,6 +18,10 @@ References:
       treatment and structural parameters" (Double ML)
     - Rosenbaum & Rubin (1983), "The central role of the propensity score in
       observational studies for causal effects" (propensity score matching)
+    - Horvitz & Thompson (1952), "A generalization of sampling without
+      replacement from a finite universe" (IPW)
+    - Robins, Rotnitzky & Zhao (1994), "Estimation of regression coefficients
+      when some regressors are not always observed" (AIPW)
 """
 
 import numpy as np
@@ -50,6 +54,34 @@ def _cross_fit_propensity(model, X, w, n_splits, random_state):
         m = clone(model).fit(X[train_idx], w[train_idx])
         preds[test_idx] = m.predict_proba(X[test_idx])[:, 1]
     return _clip_propensity(preds)
+
+
+def _cross_fit_aipw_pseudo_outcome(outcome_model, propensity_model, X, w, y,
+                                   n_splits, random_state):
+    """Out-of-fold AIPW pseudo-outcome phi, with E[phi | X = x] = tau(x)
+    if either the outcome models or the propensity model is correct."""
+    n = len(y)
+    mu0_hat = np.zeros(n)
+    mu1_hat = np.zeros(n)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    for train_idx, test_idx in kf.split(X):
+        Xtr, wtr, ytr = X[train_idx], w[train_idx], y[train_idx]
+        m0 = clone(outcome_model).fit(Xtr[wtr == 0], ytr[wtr == 0])
+        m1 = clone(outcome_model).fit(Xtr[wtr == 1], ytr[wtr == 1])
+        mu0_hat[test_idx] = m0.predict(X[test_idx])
+        mu1_hat[test_idx] = m1.predict(X[test_idx])
+    e_hat = _cross_fit_propensity(propensity_model, X, w, n_splits,
+                                  random_state)
+
+    return (mu1_hat - mu0_hat
+            + w * (y - mu1_hat) / e_hat
+            - (1 - w) * (y - mu0_hat) / (1 - e_hat))
+
+
+def _normal_confint(center, se, alpha):
+    from statistics import NormalDist
+    z = NormalDist().inv_cdf(1 - alpha / 2)
+    return center - z * se, center + z * se
 
 
 class SLearner:
@@ -214,9 +246,91 @@ class DoubleML:
         return self
 
     def confint(self, alpha=0.05):
-        from statistics import NormalDist
-        z = NormalDist().inv_cdf(1 - alpha / 2)
-        return self.ate_ - z * self.se_, self.ate_ + z * self.se_
+        return _normal_confint(self.ate_, self.se_, alpha)
+
+    def predict_cate(self, X):
+        return np.full(len(X), self.ate_)
+
+
+class IPW:
+    """Inverse propensity weighting (Hajek estimator) for the ATE.
+
+    Cross-fits e(x) = P(w=1|x), then reweights each arm by 1/e (treated) and
+    1/(1-e) (control) so both look like the full population:
+
+        ATE = sum_i w_i y_i / e_i        / sum_i w_i / e_i
+            - sum_i (1-w_i) y_i / (1-e_i) / sum_i (1-w_i) / (1-e_i)
+
+    This is the normalized (Hajek) form, which is less variable than dividing
+    by n (Horvitz-Thompson). Needs no outcome model at all; consistent if the
+    propensity model is right, but sensitive to extreme weights -- hence the
+    propensity clipping. The standard error treats the propensities as known,
+    which is (mildly) conservative when they are estimated.
+
+    After fit: `ate_`, `se_`, and `confint(alpha)`. `predict_cate` returns the
+    constant ATE for interface compatibility.
+    """
+
+    def __init__(self, propensity_model, n_splits=5, random_state=0):
+        self.propensity_model = propensity_model
+        self.n_splits = n_splits
+        self.random_state = random_state
+
+    def fit(self, X, w, y):
+        e = _cross_fit_propensity(
+            self.propensity_model, X, w, self.n_splits, self.random_state)
+
+        u1 = w / e            # weights that map the treated to the population
+        u0 = (1 - w) / (1 - e)
+        mu1 = np.sum(u1 * y) / np.sum(u1)
+        mu0 = np.sum(u0 * y) / np.sum(u0)
+        self.ate_ = mu1 - mu0
+
+        # Influence function of the Hajek difference (propensities as known).
+        psi = u1 * (y - mu1) / u1.mean() - u0 * (y - mu0) / u0.mean()
+        self.se_ = psi.std(ddof=1) / np.sqrt(len(y))
+        return self
+
+    def confint(self, alpha=0.05):
+        return _normal_confint(self.ate_, self.se_, alpha)
+
+    def predict_cate(self, X):
+        return np.full(len(X), self.ate_)
+
+
+class AIPW:
+    """Augmented IPW (doubly robust) estimator of the ATE.
+
+    Cross-fits mu0, mu1, and e, builds the AIPW pseudo-outcome phi (the same
+    one the DR-learner regresses on X), and simply averages it:
+
+        ATE = mean(phi),    se = sd(phi) / sqrt(n)
+
+    Consistent if either the outcome models or the propensity model is
+    correct, and the influence-function standard error is honest under
+    cross-fitting -- the ATE analogue of the DR-learner.
+
+    After fit: `ate_`, `se_`, and `confint(alpha)`. `predict_cate` returns the
+    constant ATE for interface compatibility.
+    """
+
+    def __init__(self, outcome_model, propensity_model, n_splits=5,
+                 random_state=0):
+        self.outcome_model = outcome_model
+        self.propensity_model = propensity_model
+        self.n_splits = n_splits
+        self.random_state = random_state
+
+    def fit(self, X, w, y):
+        phi = _cross_fit_aipw_pseudo_outcome(
+            self.outcome_model, self.propensity_model, X, w, y,
+            self.n_splits, self.random_state)
+        self.ate_ = phi.mean()
+        self.se_ = phi.std(ddof=1) / np.sqrt(len(y))
+        return self
+
+    def confint(self, alpha=0.05):
+        return _normal_confint(self.ate_, self.se_, alpha)
 
     def predict_cate(self, X):
         return np.full(len(X), self.ate_)
@@ -239,31 +353,65 @@ class PropensityScoreMatching:
     because each counterfactual rests on a single neighbor, and it estimates
     averages only, not tau(x).
 
-    After fit: `att_`, `atc_`, `ate_`. `predict_cate` returns the constant ATE
-    for interface compatibility.
+    A `caliper` (in standard deviations of the logit score; Austin (2011)
+    recommends 0.2) drops pairs whose scores are further apart than that, at
+    the cost of estimating the effect on the matchable units only.
+
+    Matching is only trustworthy if it actually balances the covariates, so
+    fit also computes standardized mean differences per covariate,
+
+        SMD_j = (mean of X_j, treated - mean of X_j, control) / pooled SD_j,
+
+    before matching (`smd_before_`, treated vs control arms as observed) and
+    after (`smd_after_`, each arm pooled with its matches' counterfactuals),
+    both scaled by the *pre-matching* pooled SD so they are comparable.
+    |SMD| below ~0.1 is conventionally considered balanced.
+
+    After fit: `att_`, `atc_`, `ate_`, `smd_before_`, `smd_after_`,
+    `n_matched_treated_`, `n_matched_control_`. `predict_cate` returns the
+    constant ATE for interface compatibility.
     """
 
-    def __init__(self, propensity_model):
+    def __init__(self, propensity_model, caliper=None):
         self.propensity_model = propensity_model
+        self.caliper = caliper
 
     def fit(self, X, w, y):
         e = _clip_propensity(
             clone(self.propensity_model).fit(X, w).predict_proba(X)[:, 1])
         score = np.log(e / (1 - e)).reshape(-1, 1)
 
-        s0, y0 = score[w == 0], y[w == 0]
-        s1, y1 = score[w == 1], y[w == 1]
+        s0, X0, y0 = score[w == 0], X[w == 0], y[w == 0]
+        s1, X1, y1 = score[w == 1], X[w == 1], y[w == 1]
 
         # For each treated unit, the nearest control (and vice versa).
         match_for_treated = NearestNeighbors(n_neighbors=1).fit(s0)
         match_for_control = NearestNeighbors(n_neighbors=1).fit(s1)
-        idx0 = match_for_treated.kneighbors(s1, return_distance=False)[:, 0]
-        idx1 = match_for_control.kneighbors(s0, return_distance=False)[:, 0]
+        d0, idx0 = (a[:, 0] for a in match_for_treated.kneighbors(s1))
+        d1, idx1 = (a[:, 0] for a in match_for_control.kneighbors(s0))
 
-        self.att_ = np.mean(y1 - y0[idx0])
-        self.atc_ = np.mean(y1[idx1] - y0)
-        n0, n1 = len(y0), len(y1)
-        self.ate_ = (n1 * self.att_ + n0 * self.atc_) / (n0 + n1)
+        if self.caliper is not None:
+            max_dist = self.caliper * score.std()
+            keep1, keep0 = d0 <= max_dist, d1 <= max_dist
+        else:
+            keep1 = np.ones(len(s1), dtype=bool)
+            keep0 = np.ones(len(s0), dtype=bool)
+        self.n_matched_treated_ = int(keep1.sum())
+        self.n_matched_control_ = int(keep0.sum())
+
+        self.att_ = np.mean(y1[keep1] - y0[idx0[keep1]])
+        self.atc_ = np.mean(y1[idx1[keep0]] - y0[keep0])
+        n1m, n0m = self.n_matched_treated_, self.n_matched_control_
+        self.ate_ = (n1m * self.att_ + n0m * self.atc_) / (n0m + n1m)
+
+        # Balance diagnostics: the matched "treated" arm is every matched unit
+        # plus every match standing in for a treated unit, and symmetrically.
+        sd = np.sqrt((X1.var(axis=0) + X0.var(axis=0)) / 2)
+        self.smd_before_ = (X1.mean(axis=0) - X0.mean(axis=0)) / sd
+        X1_matched = np.vstack([X1[keep1], X1[idx1[keep0]]])
+        X0_matched = np.vstack([X0[idx0[keep1]], X0[keep0]])
+        self.smd_after_ = (
+            X1_matched.mean(axis=0) - X0_matched.mean(axis=0)) / sd
         return self
 
     def predict_cate(self, X):
@@ -289,24 +437,9 @@ class DRLearner:
         self.random_state = random_state
 
     def fit(self, X, w, y):
-        n = len(y)
-        mu0_hat = np.zeros(n)
-        mu1_hat = np.zeros(n)
-        kf = KFold(n_splits=self.n_splits, shuffle=True,
-                   random_state=self.random_state)
-        for train_idx, test_idx in kf.split(X):
-            Xtr, wtr, ytr = X[train_idx], w[train_idx], y[train_idx]
-            m0 = clone(self.outcome_model).fit(Xtr[wtr == 0], ytr[wtr == 0])
-            m1 = clone(self.outcome_model).fit(Xtr[wtr == 1], ytr[wtr == 1])
-            mu0_hat[test_idx] = m0.predict(X[test_idx])
-            mu1_hat[test_idx] = m1.predict(X[test_idx])
-        e_hat = _cross_fit_propensity(
-            self.propensity_model, X, w, self.n_splits, self.random_state)
-
-        pseudo = (mu1_hat - mu0_hat
-                  + w * (y - mu1_hat) / e_hat
-                  - (1 - w) * (y - mu0_hat) / (1 - e_hat))
-
+        pseudo = _cross_fit_aipw_pseudo_outcome(
+            self.outcome_model, self.propensity_model, X, w, y,
+            self.n_splits, self.random_state)
         self.effect_model_ = clone(self.effect_model).fit(X, pseudo)
         return self
 
